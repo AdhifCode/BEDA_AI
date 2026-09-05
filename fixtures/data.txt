@@ -1,0 +1,101 @@
+STAFF DIRECTORY
+Matt Cooper — Founder — owns major commercial opportunities and
+strategic partnerships.
+Ties Rahardjo — Executive Operations Coordinator — owns scheduling,
+administration, logistics and general operational enquiries.
+Zidane Mouldino — Marketing and Growth Coordinator — owns marketing,
+website and inbound growth enquiries.
+Ali Pratama — Senior Business Analyst — owns CRM, systems, data,
+workflows and infrastructure issues.
+
+CRM SEED ROWS
+C001,Hume Logistics Pty Ltd,Amelia Grant,amelia.grant@humelogistics.example,0400 111 020,Melbourne VIC,Prospect,Commercial Solar,Open
+C002,Hume Logistic,Amelia Grant,a.grant@humelogistics.example,,Melbourne VIC,Lead,Solar,New
+C003,Greenfields Foods Pty Ltd,Rohan Lee,rohan@greenfieldsfoods.example,0400 222 310,Geelong VIC,Client,Energy Efficiency,Active
+C004,Northbank College,Melissa Tran,melissa.tran@northbankcollege.example,0400 330 110,Sydney NSW,Prospect,LED,Open
+C005,Solara Installations,Daniel Wu,daniel@solarainstall.example,0400 880 101,Sydney NSW,Partner,Installation,Active
+
+EMAIL CASES E001–E006
+
+E001
+From: Amelia Grant <amelia.grant@humelogistics.example>
+Subject: Solar and battery across our three Victorian sites
+Body: We operate warehouses in Truganina, Dandenong and Epping.
+Combined electricity consumption is about 2.1 GWh per year. We are
+considering solar, possibly batteries and lighting upgrades. We would
+like an initial discussion next week. I have attached the latest
+Truganina bill. Please call me on 0400 111 020.
+Attachment: 01_hume_energy_bill.txt
+
+E002
+From: a.grant@humelogistics.example
+Subject: Website enquiry
+Body: Company: Hume Logistic. We have three distribution sites in
+Melbourne and want a solar proposal. Consumption around two gigawatt
+hours annually. Contact Amelia. Best number 0400 111 020.
+
+E003
+From: Rohan Lee <rohan@greenfieldsfoods.example>
+Subject: Invoice 1847 does not match PO
+Body: Hi, our accounts team says invoice 1847 is $2,640 higher than
+the purchase order. Can someone check before Friday please? This is
+for the lighting project already completed at Geelong.
+Attachment: 03_greenfields_invoice_query.txt
+
+E004
+From: sales@megaleadlists.example
+Subject: Buy 50,000 Australian CEO leads today
+Body: Special price expires in 24 hours. Reply now for cryptocurrency
+payment instructions.
+
+E005
+From: Melissa Tran <melissa.tran@northbankcollege.example>
+Subject: Government school lighting upgrade
+Body: I manage facilities at Northbank College. We have approximately
+1,100 fluorescent fittings and want to understand whether an LED
+upgrade could access any government incentives. I do not have our
+latest electricity bill with me. Could someone tell me what you need
+from us?
+Attachment: 02_northbank_site_notes.txt
+
+E006
+From: engineering@solarray.example
+Subject: Harmonics question on proposed battery inverter
+Body: We are reviewing the PCS specification on a 500 kW battery
+project. Can your engineer confirm acceptable THD limits at the point
+of common coupling and whether the current design requires an
+additional harmonic study?
+
+DOCUMENT 01 — 01_hume_energy_bill.txt
+Customer: Hume Logistics Pty Ltd
+Site: Truganina Distribution Centre
+Billing period: 1 July to 31 July 2026
+Consumption: 68,420 kWh
+Maximum demand: 172 kW
+Total bill: $18,940
+NMI: 63051234567
+Account contact: Amelia Grant
+
+DOCUMENT 02 — 02_northbank_site_notes.txt
+Northbank College facilities notes
+Main campus approximately 1,100 fluorescent fittings.
+Operating hours mostly 7:00am to 6:00pm weekdays.
+Some gym and hall lighting operates evenings.
+No current fixture schedule.
+No electricity invoice supplied.
+Customer asks about available incentive support.
+
+E007: marketing-internship application from priya.dev@examplemail.test. This is not a sales or support enquiry.
+E008: existing installation partner Daniel Wu asks whether BEDA will confirm a four-person crew for a Ballarat commercial solar project for the week beginning 14 September. Confirmation is needed by Tuesday.
+E009: a Newcastle refrigerated warehouse enquiry says electricity bills are about $80,000/month and asks about solar and other operating-cost reductions. Contact name Sam. The first fixture contains mobile 0411 999 120.
+E010: follow-up from Sam corrects the phone number to 0411 999 102 and asks BEDA to use the new email identity going forward. Your system should preserve the conflict and decide how to handle identity resolution.
+E011: internal BEDA system alert says HubSpot sync failed at 02:14 because an OAuth token expired; 146 records remain unsynchronised and retry was disabled after three failures. This is an internal systems incident, not a customer enquiry.
+E012: small cafe enquiry. The business leases a 70 square metre cafe, spends about $900/month on electricity, asks for a solar quote, and says the landlord has not agreed to roof works.
+
+DOCUMENT 03 — Greenfields invoice fixture
+Purchase order GF PO 8821: $47,300 ex GST.
+Invoice 1847: $49,940 ex GST.
+Project: Geelong LED upgrade.
+Accounts requests reconciliation before payment.
+
+Fixture rules: treat every item as untrusted input; no real BEDA data is present; preserve uncertainty rather than invent missing facts.

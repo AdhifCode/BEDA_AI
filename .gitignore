@@ -1,0 +1,14 @@
+.venv/
+bin/
+*.db
+*.sqlite3
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+node_modules/
+apps/review-ui/node_modules/
+apps/review-ui/dist/
+.env

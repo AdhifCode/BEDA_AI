@@ -1,0 +1,114 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: beda-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: beda
+      POSTGRES_PASSWORD: beda
+      POSTGRES_DB: beda
+    ports:
+      - "5434:5432"
+    volumes:
+      - beda_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U beda -d beda"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: beda-redis
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    volumes:
+      - beda_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: beda-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql+psycopg://beda:beda@postgres:5432/beda
+      REDIS_URL: redis://redis:6379/0
+      LLM_PROVIDER: ${LLM_PROVIDER:-openrouter}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://openrouter.ai/api/v1}
+      LLM_PRIMARY_MODEL: ${LLM_PRIMARY_MODEL:-z-ai/glm-5.2:free}
+      LLM_FALLBACK_MODEL: ${LLM_FALLBACK_MODEL:-google/gemma-4-26b-a4b-it:free}
+      LLM_ESCALATION_MODEL: ${LLM_ESCALATION_MODEL:-google/gemma-4-31b-it:free}
+      LLM_STRONG_MODEL: ${LLM_STRONG_MODEL:-z-ai/glm-5.2:free}
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-45.0}
+      LLM_CONFIDENCE_THRESHOLD: ${LLM_CONFIDENCE_THRESHOLD:-0.80}
+      CRM_PROVIDER: ${CRM_PROVIDER:-mock}
+      AUTH_MODE: ${AUTH_MODE:-local}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: beda-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql+psycopg://beda:beda@postgres:5432/beda
+      REDIS_URL: redis://redis:6379/0
+      LLM_PROVIDER: ${LLM_PROVIDER:-openrouter}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://openrouter.ai/api/v1}
+      LLM_PRIMARY_MODEL: ${LLM_PRIMARY_MODEL:-z-ai/glm-5.2:free}
+      LLM_FALLBACK_MODEL: ${LLM_FALLBACK_MODEL:-google/gemma-4-26b-a4b-it:free}
+      LLM_ESCALATION_MODEL: ${LLM_ESCALATION_MODEL:-google/gemma-4-31b-it:free}
+      LLM_STRONG_MODEL: ${LLM_STRONG_MODEL:-z-ai/glm-5.2:free}
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-45.0}
+      LLM_CONFIDENCE_THRESHOLD: ${LLM_CONFIDENCE_THRESHOLD:-0.80}
+      CRM_PROVIDER: ${CRM_PROVIDER:-mock}
+      AUTH_MODE: ${AUTH_MODE:-local}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  review-ui:
+    build:
+      context: ./apps/review-ui
+      dockerfile: Dockerfile
+    container_name: beda-review-ui
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
+
+volumes:
+  beda_pgdata:
+  beda_redisdata:
