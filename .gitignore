@@ -1,14 +1,143 @@
-.venv/
-bin/
-*.db
-*.sqlite3
+# ============================================================
+# BEDA_AI - Git Ignore
+# ============================================================
+
+# -------------------------
+# Environment & Secrets
+# -------------------------
+.env
+.env.*
+!.env.example
+*.env.local
+*.env.production
+*.env.development
+
+# API keys / credentials
+*.pem
+*.key
+*.crt
+credentials.json
+service-account.json
+secrets.json
+
+# -------------------------
+# Python
+# -------------------------
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Test / coverage
 .pytest_cache/
 .coverage
+.coverage.*
 htmlcov/
-dist/
-node_modules/
-apps/review-ui/node_modules/
-apps/review-ui/dist/
-.env
+.tox/
+.nox/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+
+# -------------------------
+# Application Data
+# -------------------------
+*.db
+*.sqlite
+*.sqlite3
+
+data/
+tmp/
+temp/
+
+# -------------------------
+# Logs
+# -------------------------
+*.log
+logs/
+
+# -------------------------
+# Runtime
+# -------------------------
+*.pid
+*.pid.lock
+
+# -------------------------
+# Redis / local services
+# -------------------------
+dump.rdb
+appendonly.aof
+
+# -------------------------
+# Docker
+# -------------------------
+docker-compose.override.yml
+docker-compose.local.yml
+
+# -------------------------
+# IDE / Editors
+# -------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# -------------------------
+# OS
+# -------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# -------------------------
+# Jupyter
+# -------------------------
+.ipynb_checkpoints/
+
+# -------------------------
+# Ruff / tooling
+# -------------------------
+.ruff_cache/
+
+# -------------------------
+# Generated files
+# -------------------------
+*.bak
+*.tmp
+*.generated
+
+# -------------------------
+# Local configuration
+# -------------------------
+config.local.*
+settings.local.*
+
+# -------------------------
+# Secrets accidentally generated
+# -------------------------
+*.secret
+*.secrets
+*.md
+!README.md
+!LICENSE.md

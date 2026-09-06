@@ -27,6 +27,7 @@ class WorkflowStatus(str, Enum):
     ROUTED = "ROUTED"
     EXECUTE = "EXECUTE"
     COMPLETED = "COMPLETED"
+    DEFERRED = "DEFERRED"
     DEAD_LETTER = "DEAD_LETTER"
     QUARANTINED = "QUARANTINED"
 
@@ -127,6 +128,7 @@ class CRMResolutionResult(BaseModel):
     selected_customer_id: Optional[str] = None
     candidates: List[CRMCandidate] = Field(default_factory=list)
     conflict_flags: List[str] = Field(default_factory=list)
+    correction_provenance: Optional[Dict[str, Any]] = None
     decision_actor: Optional[str] = None
     decided_at: Optional[datetime] = None
 

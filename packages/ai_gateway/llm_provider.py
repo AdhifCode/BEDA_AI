@@ -24,6 +24,21 @@ from packages.validation.prompt_safety import format_bounded_prompt
 logger = get_logger("ai_gateway")
 
 
+class ModelUnavailableError(RuntimeError):
+    """
+    Raised when all configured external LLM models fail or are unavailable.
+    Distinguishes live production outages from deterministic test fixture fallbacks.
+    """
+
+    def __init__(
+        self,
+        message: str = "All configured external models are unavailable",
+        models_attempted: Optional[List[str]] = None,
+    ):
+        super().__init__(message)
+        self.models_attempted = models_attempted or []
+
+
 class LLMProvider(Protocol):
     async def classify_and_extract(
         self,
@@ -627,6 +642,7 @@ class OpenAICompatibleProvider:
         self.timeout = timeout
         self.extra_headers = extra_headers or {}
         self.provider_name = provider_name
+        self.model_unavailable: bool = False
         self.fallback = FakeLLMProvider()
         self.last_call_stats: Dict[str, Any] = {
             "provider": self.provider_name,
@@ -719,19 +735,24 @@ class OpenAICompatibleProvider:
     ) -> Tuple[ClassificationResult, ExtractedInformation]:
         start_time = time.perf_counter()
         if not self.api_key:
+            self.model_unavailable = True
             self.last_call_stats = {
-                "provider": "fake",
+                "provider": self.provider_name,
                 "model": "no_api_key",
                 "primary_model": self.primary_model,
                 "fallback_model": self.fallback_model,
                 "escalation_model": self.escalation_model,
+                "models_attempted": [self.primary_model],
                 "latency_ms": 0,
                 "input_tokens": 0,
                 "output_tokens": 0,
-                "is_fallback": True,
-                "error_code": "NO_API_KEY",
+                "is_fallback": False,
+                "error_code": "MODEL_UNAVAILABLE",
             }
-            return await self.fallback.classify_and_extract(enquiry, context)
+            raise ModelUnavailableError(
+                "No API key provided for live LLM provider",
+                models_attempted=[self.primary_model],
+            )
 
         customer_parts = []
         if enquiry.subject:
@@ -831,14 +852,15 @@ class OpenAICompatibleProvider:
             }
             return candidate_result, candidate_extracted
 
-        # All models failed: fallback to deterministic provider
+        # All models failed: raise ModelUnavailableError for workflow degraded mode
         elapsed_ms = int((time.perf_counter() - start_time) * 1000)
         logger.warning(
-            f"All LLM models {attempted_models} failed. Falling back to deterministic provider. Error: {last_error}"
+            f"All LLM models {attempted_models} failed. Raising ModelUnavailableError. Error: {last_error}"
         )
+        self.model_unavailable = True
         self.last_call_stats = {
-            "provider": "fake",
-            "model": "fallback",
+            "provider": self.provider_name,
+            "model": "unavailable",
             "primary_model": self.primary_model,
             "fallback_model": self.fallback_model,
             "escalation_model": self.escalation_model,
@@ -846,10 +868,13 @@ class OpenAICompatibleProvider:
             "latency_ms": elapsed_ms,
             "input_tokens": 0,
             "output_tokens": 0,
-            "is_fallback": True,
-            "error_code": f"ALL_MODELS_FAILED: {str(last_error)[:100]}",
+            "is_fallback": False,
+            "error_code": "MODEL_UNAVAILABLE",
         }
-        return await self.fallback.classify_and_extract(enquiry, context)
+        raise ModelUnavailableError(
+            f"All configured live models failed: {attempted_models}. Last error: {last_error}",
+            models_attempted=attempted_models,
+        )
 
     async def detect_missing_information(
         self,
@@ -857,7 +882,8 @@ class OpenAICompatibleProvider:
         extracted: ExtractedInformation,
     ) -> List[MissingInfoItem]:
         if not self.api_key:
-            return await self.fallback.detect_missing_information(enquiry, extracted)
+            self.model_unavailable = True
+            raise ModelUnavailableError("No API key provided for live LLM provider", models_attempted=[self.primary_model])
 
         customer_data = f"Subject: {enquiry.subject or ''}\nBody: {enquiry.body_text}"
         extracted_json = json.dumps(extracted.model_dump(), default=str)
@@ -903,7 +929,11 @@ class OpenAICompatibleProvider:
                 next_info = f" Retrying with backup model '{models_to_try[idx+1]}'..." if idx + 1 < len(models_to_try) else " Falling back to deterministic provider."
                 logger.warning(f"LLM model '{current_model}' detect_missing_information failed: {e}.{next_info}")
 
-        return await self.fallback.detect_missing_information(enquiry, extracted)
+        self.model_unavailable = True
+        raise ModelUnavailableError(
+            f"All configured live models failed detect_missing_information: {models_to_try}",
+            models_attempted=models_to_try,
+        )
 
     async def draft_response(
         self,
@@ -912,11 +942,18 @@ class OpenAICompatibleProvider:
         knowledge_context: Optional[Dict[str, Any]] = None,
     ) -> DraftResult:
         if not self.api_key:
-            return await self.fallback.draft_response(enquiry, crm_context, knowledge_context)
+            self.model_unavailable = True
+            raise ModelUnavailableError("No API key provided for live LLM provider", models_attempted=[self.primary_model])
 
         category = enquiry.classification.category if enquiry.classification else ""
         if category == "spam/unwanted":
-            return await self.fallback.draft_response(enquiry, crm_context, knowledge_context)
+            return DraftResult(
+                draft_type="none",
+                content="[QUARANTINED - NO OUTBOUND DRAFT FOR SPAM]",
+                grounding_refs=["Message classified as unsolicited spam"],
+                requires_approval=False,
+                status="QUARANTINED",
+            )
 
         customer_data = f"Subject: {enquiry.subject or ''}\nBody: {enquiry.body_text}"
         crm_json = json.dumps(crm_context.model_dump() if crm_context else {}, default=str)
@@ -970,7 +1007,11 @@ class OpenAICompatibleProvider:
                 next_info = f" Retrying with backup model '{models_to_try[idx+1]}'..." if idx + 1 < len(models_to_try) else " Falling back to deterministic provider."
                 logger.warning(f"LLM model '{current_model}' draft_response failed: {e}.{next_info}")
 
-        return await self.fallback.draft_response(enquiry, crm_context, knowledge_context)
+        self.model_unavailable = True
+        raise ModelUnavailableError(
+            f"All configured live models failed draft_response: {models_to_try}",
+            models_attempted=models_to_try,
+        )
 
 
 def get_llm_provider() -> LLMProvider:

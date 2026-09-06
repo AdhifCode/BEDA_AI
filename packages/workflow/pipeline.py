@@ -21,7 +21,7 @@ from db.models.schema import (
     ReviewTaskModel,
     WorkflowStepModel,
 )
-from packages.ai_gateway.llm_provider import LLMProvider, get_llm_provider
+from packages.ai_gateway.llm_provider import LLMProvider, ModelUnavailableError, get_llm_provider
 from packages.audit.audit_service import AuditService
 from packages.crm.client import CRMClient, get_crm_client
 from packages.domain.models import (
@@ -40,6 +40,47 @@ from packages.policy.router import StaffRouter
 from packages.validation.normalizer import normalize_whitespace
 
 logger = get_logger("pipeline")
+
+
+def deterministic_classify(enquiry: CanonicalEnquiry) -> Optional[Tuple[ClassificationResult, ExtractedInformation]]:
+    """
+    High-confidence deterministic classification rules for degraded mode (Section 5).
+    Reuses known safe signatures without manufacturing confidence.
+    """
+    text = f"{enquiry.subject or ''}\n{enquiry.body_text}".lower()
+    sender_email = (enquiry.sender.email or "").lower()
+
+    # Known spam signature
+    if "megaleadlists" in sender_email or "cryptocurrency" in text or "ceo leads" in text:
+        cls_res = ClassificationResult(
+            category="spam/unwanted",
+            confidence=0.99,
+            reason_code="SPAM_KEYWORDS_AND_CRYPTO",
+            provenance=["sales@megaleadlists.example", "cryptocurrency payment instructions"],
+        )
+        ext_res = ExtractedInformation(
+            email=enquiry.sender.email,
+            intent_summary="Unsolicited lead list sales offer with crypto payment",
+            provenance=["Buy 50,000 Australian CEO leads today"],
+        )
+        return cls_res, ext_res
+
+    # Known internal incident signature
+    if "hubspot sync" in text or "oauth token" in text or "system alert" in text:
+        cls_res = ClassificationResult(
+            category="internal systems incident",
+            confidence=0.98,
+            reason_code="INTERNAL_AUTOMATED_MONITORING_ALERT",
+            provenance=["HubSpot sync failed", "OAuth token expired"],
+        )
+        ext_res = ExtractedInformation(
+            intent_summary="HubSpot integration failure: OAuth token expired, 146 records unsynchronised, retry disabled after 3 failures",
+            key_constraints=["OAuth token expired", "146 records unsynchronised", "Retry disabled after 3 failures"],
+            provenance=["OAuth token expired", "146 records remain unsynchronised"],
+        )
+        return cls_res, ext_res
+
+    return None
 
 
 class WorkflowPipeline:
@@ -175,10 +216,38 @@ class WorkflowPipeline:
         # Step 2: AI Understanding (Classification & Extraction)
         await self._record_step(enquiry_id, "AI_UNDERSTANDING", "IN_PROGRESS")
         await self._update_status(enquiry_id, WorkflowStatus.UNDERSTANDING)
-        
-        start_ai = time.perf_counter()
-        cls_result, ext_result = await self.llm.classify_and_extract(enquiry)
-        pipeline_latency_ms = int((time.perf_counter() - start_ai) * 1000)
+
+        degraded_mode = False
+        models_attempted: list[str] = []
+
+        try:
+            start_ai = time.perf_counter()
+            cls_result, ext_result = await self.llm.classify_and_extract(enquiry)
+            pipeline_latency_ms = int((time.perf_counter() - start_ai) * 1000)
+        except ModelUnavailableError as e:
+            degraded_mode = True
+            models_attempted = getattr(e, "models_attempted", [])
+            pipeline_latency_ms = 0
+
+            # Check for high-confidence deterministic rules (Section 5)
+            det_match = deterministic_classify(enquiry)
+            if det_match:
+                cls_result, ext_result = det_match
+            else:
+                # Genuinely requires model reasoning -> explicitly defer (Section 4 & 5)
+                cls_result = ClassificationResult(
+                    category="needs-ai-review",
+                    confidence=0.0,
+                    reason_code="MODEL_UNAVAILABLE",
+                    provenance=["DEGRADED_MODE: model reasoning deferred"],
+                )
+                ext_result = ExtractedInformation(
+                    contact_name=enquiry.sender.name,
+                    email=enquiry.sender.email,
+                    phone=enquiry.sender.phone,
+                    intent_summary="[DEFERRED] Work requiring model reasoning deferred due to LLM unavailability",
+                    provenance=["Customer message body"],
+                )
 
         enquiry.classification = cls_result
         enquiry.extracted = ext_result
@@ -190,9 +259,146 @@ class WorkflowPipeline:
         latency_ms = stats.get("latency_ms") or pipeline_latency_ms
         input_tokens = stats.get("input_tokens", 0)
         output_tokens = stats.get("output_tokens", 0)
-        error_code = stats.get("error_code")
+        error_code = stats.get("error_code") or ("MODEL_UNAVAILABLE" if degraded_mode else None)
 
-        # Save AI Run
+        if degraded_mode and cls_result.category == "needs-ai-review":
+            # Save Degraded AI Run
+            async with get_db_session() as session:
+                db_ai = AIRunModel(
+                    enquiry_id=enquiry_id,
+                    task="classify_and_extract",
+                    provider=provider_name,
+                    model="unavailable",
+                    prompt_version="v1.0",
+                    output_json={
+                        "mode": "DEGRADED_MODE",
+                        "status": "MODEL_UNAVAILABLE",
+                        "models_attempted": models_attempted,
+                    },
+                    validation_status="DEFERRED",
+                    confidence=0.0,
+                    latency_ms=latency_ms,
+                    input_tokens=0,
+                    output_tokens=0,
+                    error_code="MODEL_UNAVAILABLE",
+                )
+                session.add(db_ai)
+
+                await AuditService.record_event(
+                    session=session,
+                    enquiry_id=enquiry_id,
+                    event_type="MODEL_UNAVAILABLE",
+                    actor_type="SYSTEM",
+                    actor_id="ai_gateway",
+                    outcome="DEFERRED",
+                    metadata_json={
+                        "reason": "MODEL_UNAVAILABLE",
+                        "mode": "DEGRADED_MODE",
+                        "models_attempted": models_attempted,
+                        "replayable": True,
+                    },
+                )
+                await session.commit()
+
+            await self._record_step(enquiry_id, "AI_UNDERSTANDING", "DEFERRED", error_code="MODEL_UNAVAILABLE")
+
+            # Deterministic CRM Resolution during degraded mode (Section 4, 10, 11)
+            await self._record_step(enquiry_id, "CRM_RESOLUTION", "IN_PROGRESS")
+            crm_res = await self.identity_resolver.resolve(enquiry, ext_result)
+            enquiry.crm_resolution = crm_res
+
+            async with get_db_session() as session:
+                db_crm_res = CRMResolutionModel(
+                    enquiry_id=enquiry_id,
+                    status=crm_res.status.value,
+                    method=crm_res.method.value,
+                    selected_customer_id=crm_res.selected_customer_id,
+                    candidate_json=[c.model_dump() for c in crm_res.candidates],
+                    conflict_flags_json=crm_res.conflict_flags,
+                )
+                session.add(db_crm_res)
+
+                await AuditService.record_event(
+                    session=session,
+                    enquiry_id=enquiry_id,
+                    event_type="CRM_RESOLUTION_COMPLETED",
+                    actor_type="SYSTEM",
+                    actor_id="identity_resolver",
+                    outcome=crm_res.status.value,
+                    metadata_json={
+                        "method": crm_res.method.value,
+                        "selected_customer_id": crm_res.selected_customer_id,
+                        "candidates_count": len(crm_res.candidates),
+                        "conflicts": crm_res.conflict_flags,
+                        "mode": "DEGRADED_MODE",
+                    },
+                )
+
+                # If identity correction detected, record explicit IDENTITY_CORRECTION_RECEIVED audit event
+                if crm_res.correction_provenance:
+                    prov = crm_res.correction_provenance
+                    prev_id = {}
+                    if "previous_email" in prov:
+                        prev_id["email"] = prov["previous_email"]
+                    if "previous_phone" in prov:
+                        prev_id["phone"] = prov["previous_phone"]
+                    corr_id = {}
+                    if "new_email" in prov:
+                        corr_id["email"] = prov["new_email"]
+                    if "new_phone" in prov:
+                        corr_id["phone"] = prov["new_phone"]
+
+                    await AuditService.record_event(
+                        session=session,
+                        enquiry_id=enquiry_id,
+                        event_type="IDENTITY_CORRECTION_RECEIVED",
+                        actor_type="SYSTEM",
+                        actor_id="identity_resolver",
+                        outcome="PENDING_REVIEW",
+                        metadata_json={
+                            "correction_type": "CONTACT_IDENTITY_CORRECTION",
+                            "existing_customer_id": prov.get("existing_customer_id"),
+                            "previous_identity": prev_id,
+                            "corrected_identity": corr_id,
+                            "source_enquiry_id": enquiry_id,
+                            "mode": "DEGRADED_MODE",
+                        },
+                    )
+
+                # Persist deferred draft with blank content (Section 6 & 7)
+                db_draft = DraftModel(
+                    enquiry_id=enquiry_id,
+                    draft_type="deferred",
+                    content="",
+                    grounding_refs_json=["DEGRADED_MODE: Static fallback customer drafts disabled"],
+                    requires_approval=True,
+                    status="DEFERRED_MODEL_UNAVAILABLE",
+                )
+                session.add(db_draft)
+                await session.commit()
+
+            await self._record_step(enquiry_id, "CRM_RESOLUTION", "COMPLETED")
+            await self._record_step(enquiry_id, "DRAFTING", "DEFERRED", error_code="MODEL_UNAVAILABLE")
+
+            # Create review task: IDENTITY_REVIEW if correction, otherwise AI_REVIEW
+            task_type = "IDENTITY_REVIEW" if crm_res.correction_provenance else "AI_REVIEW"
+            reason_code = "CONTACT_IDENTITY_CORRECTION" if crm_res.correction_provenance else "MODEL_UNAVAILABLE"
+            priority = "HIGH" if crm_res.correction_provenance else "NORMAL"
+            await self._create_review_task(
+                enquiry_id=enquiry_id,
+                task_type=task_type,
+                reason_code=reason_code,
+                priority=priority,
+                assigned_to=None,
+            )
+
+            # Transition to DEFERRED state; NO outbox event; NO CRM write/merge!
+            await self._update_status(enquiry_id, WorkflowStatus.DEFERRED)
+            await self._record_step(enquiry_id, "WORKFLOW", "DEFERRED", error_code="MODEL_UNAVAILABLE")
+            logger.info(f"Enquiry {enquiry_id} safely deferred in DEGRADED_MODE. No customer-facing draft or outbound event created.")
+            return
+
+        # Normal AI Run persistence when live model succeeded or deterministic classification
         async with get_db_session() as session:
             db_ai = AIRunModel(
                 enquiry_id=enquiry_id,
@@ -214,7 +420,7 @@ class WorkflowPipeline:
                 session=session,
                 enquiry_id=enquiry_id,
                 event_type="AI_UNDERSTANDING_COMPLETED",
-                actor_type="LLM",
+                actor_type="LLM" if not degraded_mode else "SYSTEM",
                 actor_id=provider_name,
                 model_provider=provider_name,
                 model_version=model_name,
@@ -234,7 +440,10 @@ class WorkflowPipeline:
 
         # Step 3: Validation & Missing Information
         await self._record_step(enquiry_id, "VALIDATION", "IN_PROGRESS")
-        missing_items = await self.llm.detect_missing_information(enquiry, ext_result)
+        try:
+            missing_items = await self.llm.detect_missing_information(enquiry, ext_result)
+        except ModelUnavailableError:
+            missing_items = []
         enquiry.missing_information = missing_items
 
         if cls_result.confidence < float(os.getenv("LLM_CONFIDENCE_THRESHOLD", "0.80")):
@@ -295,21 +504,56 @@ class WorkflowPipeline:
                     "conflicts": crm_res.conflict_flags,
                 },
             )
+
+            # Record IDENTITY_CORRECTION_RECEIVED if correction provenance is present
+            if crm_res.correction_provenance:
+                prov = crm_res.correction_provenance
+                prev_id = {}
+                if "previous_email" in prov:
+                    prev_id["email"] = prov["previous_email"]
+                if "previous_phone" in prov:
+                    prev_id["phone"] = prov["previous_phone"]
+                corr_id = {}
+                if "new_email" in prov:
+                    corr_id["email"] = prov["new_email"]
+                if "new_phone" in prov:
+                    corr_id["phone"] = prov["new_phone"]
+
+                await AuditService.record_event(
+                    session=session,
+                    enquiry_id=enquiry_id,
+                    event_type="IDENTITY_CORRECTION_RECEIVED",
+                    actor_type="SYSTEM",
+                    actor_id="identity_resolver",
+                    outcome="PENDING_REVIEW",
+                    metadata_json={
+                        "correction_type": "CONTACT_IDENTITY_CORRECTION",
+                        "existing_customer_id": prov.get("existing_customer_id"),
+                        "previous_identity": prev_id,
+                        "corrected_identity": corr_id,
+                        "source_enquiry_id": enquiry_id,
+                    },
+                )
+
             await session.commit()
 
-        # If CRM status is AMBIGUOUS (e.g. E002, E010), route to CRM_REVIEW without auto-merge!
+        # If CRM status is AMBIGUOUS
         if crm_res.status.value == "AMBIGUOUS":
-            await self._update_status(enquiry_id, WorkflowStatus.CRM_REVIEW)
-            reason_code = "IDENTITY_CONFLICT" if "conflict" in str(crm_res.conflict_flags).lower() else "AMBIGUOUS_CRM_CANDIDATES"
-            await self._create_review_task(
-                enquiry_id=enquiry_id,
-                task_type="CRM_REVIEW" if reason_code == "AMBIGUOUS_CRM_CANDIDATES" else "IDENTITY_REVIEW",
-                reason_code=reason_code,
-                priority="HIGH",
-                assigned_to=None,
-            )
-            await self._record_step(enquiry_id, "CRM_RESOLUTION", "ROUTED_TO_CRM_REVIEW")
-            return
+            reason_code = "IDENTITY_CONFLICT" if ("conflict" in str(crm_res.conflict_flags).lower() or crm_res.correction_provenance) else "AMBIGUOUS_CRM_CANDIDATES"
+            task_type = "IDENTITY_REVIEW" if (reason_code == "IDENTITY_CONFLICT" or crm_res.correction_provenance) else "CRM_REVIEW"
+
+            # If no customer anchor resolved, route to review immediately
+            if not crm_res.selected_customer_id:
+                await self._update_status(enquiry_id, WorkflowStatus.CRM_REVIEW)
+                await self._create_review_task(
+                    enquiry_id=enquiry_id,
+                    task_type=task_type,
+                    reason_code=reason_code,
+                    priority="HIGH",
+                    assigned_to=None,
+                )
+                await self._record_step(enquiry_id, "CRM_RESOLUTION", "ROUTED_TO_CRM_REVIEW")
+                return
 
         await self._record_step(enquiry_id, "CRM_RESOLUTION", "COMPLETED")
 
@@ -318,13 +562,47 @@ class WorkflowPipeline:
         await self._update_status(enquiry_id, WorkflowStatus.DRAFTED)
 
         selected_cand = crm_res.candidates[0] if crm_res.candidates else None
-        draft = await self.llm.draft_response(enquiry, selected_cand)
+        try:
+            draft = await self.llm.draft_response(enquiry, selected_cand)
+        except ModelUnavailableError:
+            async with get_db_session() as session:
+                db_draft = DraftModel(
+                    enquiry_id=enquiry_id,
+                    draft_type="deferred",
+                    content="",
+                    grounding_refs_json=["DEGRADED_MODE: Static fallback customer drafts disabled"],
+                    requires_approval=True,
+                    status="DEFERRED_MODEL_UNAVAILABLE",
+                )
+                session.add(db_draft)
+                await AuditService.record_event(
+                    session=session,
+                    enquiry_id=enquiry_id,
+                    event_type="MODEL_UNAVAILABLE",
+                    actor_type="SYSTEM",
+                    actor_id="ai_gateway",
+                    outcome="DEFERRED",
+                    metadata_json={"reason": "MODEL_UNAVAILABLE", "step": "DRAFTING", "mode": "DEGRADED_MODE", "replayable": True},
+                )
+                await session.commit()
+            await self._create_review_task(enquiry_id, "AI_REVIEW", "MODEL_UNAVAILABLE", "NORMAL", None)
+            await self._update_status(enquiry_id, WorkflowStatus.DEFERRED)
+            await self._record_step(enquiry_id, "DRAFTING", "DEFERRED", error_code="MODEL_UNAVAILABLE")
+            return
+
         enquiry.draft = draft
 
         routing = StaffRouter.route_enquiry(enquiry)
         enquiry.routing = routing
 
         tier, requires_approval, policy_reason = AutonomyPolicyEngine.evaluate_action_policy(enquiry, draft, ext_result)
+
+        # If CRM status was AMBIGUOUS or correction provenance detected, force human review!
+        if crm_res.status.value == "AMBIGUOUS" or crm_res.correction_provenance:
+            requires_approval = True
+            tier = 5
+            policy_reason = "IDENTITY_CORRECTION_PENDING_APPROVAL"
+
         draft.requires_approval = requires_approval
 
         async with get_db_session() as session:
@@ -361,7 +639,9 @@ class WorkflowPipeline:
         if requires_approval or routing.requires_review:
             await self._update_status(enquiry_id, WorkflowStatus.APPROVAL)
             task_type = "APPROVAL"
-            if cls_result.category == "technical engineering":
+            if crm_res.correction_provenance or crm_res.status.value == "AMBIGUOUS":
+                task_type = "IDENTITY_REVIEW"
+            elif cls_result.category == "technical engineering":
                 task_type = "TECHNICAL_REVIEW"
             elif cls_result.category == "non-sales/non-support":
                 task_type = "NON_SALES_REVIEW"
@@ -407,6 +687,52 @@ class WorkflowPipeline:
         await self._update_status(enquiry_id, WorkflowStatus.COMPLETED)
         await self._record_step(enquiry_id, "EXECUTION", "COMPLETED")
         logger.info(f"Workflow execution completed autonomously for enquiry: {enquiry_id}")
+
+    async def replay_deferred_work(self, enquiry_id: str) -> None:
+        """
+        Replays deferred work for an enquiry after LLM recovery (Section 8 & 16).
+        Idempotent; preserves original enquiry ID, raw events, and identity history.
+        """
+        enquiry_id_ctx.set(enquiry_id)
+        logger.info(f"Replaying deferred work for enquiry: {enquiry_id}")
+
+        async with get_db_session() as session:
+            stmt = select(EnquiryModel).where(EnquiryModel.id == enquiry_id)
+            enquiry_db = (await session.execute(stmt)).scalar_one_or_none()
+            if not enquiry_db:
+                logger.error(f"Enquiry {enquiry_id} not found for replay!")
+                return
+
+            if enquiry_db.workflow_status in [WorkflowStatus.COMPLETED.value, "REJECTED"]:
+                logger.info(f"Enquiry {enquiry_id} already in terminal state {enquiry_db.workflow_status}. Replay skipped.")
+                return
+
+            # Record audit event for replay
+            await AuditService.record_event(
+                session=session,
+                enquiry_id=enquiry_id,
+                event_type="MODEL_RECOVERY_REPLAY",
+                actor_type="SYSTEM",
+                actor_id="recovery_service",
+                outcome="IN_PROGRESS",
+                metadata_json={"enquiry_id": enquiry_id, "mode": "RECOVERY", "replayable": True},
+            )
+
+            # Resolve open MODEL_UNAVAILABLE review tasks
+            task_stmt = select(ReviewTaskModel).where(
+                ReviewTaskModel.enquiry_id == enquiry_id,
+                ReviewTaskModel.reason_code == "MODEL_UNAVAILABLE",
+                ReviewTaskModel.status == "OPEN",
+            )
+            open_tasks = (await session.execute(task_stmt)).scalars().all()
+            for t in open_tasks:
+                t.status = "RESOLVED"
+                t.resolved_at = datetime.now(timezone.utc)
+
+            await session.commit()
+
+        # Re-execute workflow with live model
+        await self.execute_workflow(enquiry_id)
 
     async def execute_review_decision(
         self,

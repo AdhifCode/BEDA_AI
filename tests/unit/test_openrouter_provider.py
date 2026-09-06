@@ -3,6 +3,7 @@ import pytest
 import httpx
 from packages.domain.models import CanonicalEnquiry, ExtractedInformation, CRMCandidate, SourceChannel
 from packages.ai_gateway.llm_provider import (
+    ModelUnavailableError,
     OpenAICompatibleProvider,
     _extract_and_parse_json,
     get_llm_provider,
@@ -165,10 +166,12 @@ async def test_openai_compatible_provider_fallback_on_error():
         sender={"email": "sales@megaleadlists.example"},
     )
 
-    cls_res, ext_res = await provider.classify_and_extract(enquiry)
-    # Must gracefully fall back to deterministic FakeLLMProvider result
-    assert cls_res.category == "spam/unwanted"
-    assert cls_res.confidence == 0.99
+    # Must NOT fall back to FakeLLMProvider; must raise ModelUnavailableError
+    with pytest.raises(ModelUnavailableError) as exc_info:
+        await provider.classify_and_extract(enquiry)
+    assert exc_info.value.models_attempted == ["meta-llama/llama-3.3-70b-instruct:free"]
+    assert provider.model_unavailable is True
+    assert provider.last_call_stats["error_code"] == "MODEL_UNAVAILABLE"
 
 
 @pytest.mark.asyncio

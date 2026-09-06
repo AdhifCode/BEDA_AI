@@ -11,6 +11,7 @@ logger = get_logger("crm")
 
 
 class CRMClient(Protocol):
+    async def find_by_customer_id(self, customer_id: str) -> Optional[Dict[str, Any]]: ...
     async def find_by_email(self, email: str) -> List[Dict[str, Any]]: ...
     async def find_by_phone(self, phone: str) -> List[Dict[str, Any]]: ...
     async def find_by_company_domain(self, domain: str) -> List[Dict[str, Any]]: ...
@@ -28,6 +29,25 @@ class MockCRMClient:
 
     def __init__(self):
         self._executed_idempotency_keys: set[str] = set()
+
+    async def find_by_customer_id(self, customer_id: str) -> Optional[Dict[str, Any]]:
+        cleaned = customer_id.strip()
+        async with get_db_session() as session:
+            stmt = select(CRMCustomerModel).where(CRMCustomerModel.customer_id == cleaned)
+            r = (await session.execute(stmt)).scalar_one_or_none()
+            if r:
+                return {
+                    "customer_id": r.customer_id,
+                    "company_name": r.company_name,
+                    "contact_name": r.contact_name,
+                    "email": r.email,
+                    "phone": r.phone,
+                    "location": r.location,
+                    "relationship_type": r.relationship_type,
+                    "interest_product": r.interest_product,
+                    "status": r.status,
+                }
+            return None
 
     async def find_by_email(self, email: str) -> List[Dict[str, Any]]:
         cleaned = email.strip().lower()

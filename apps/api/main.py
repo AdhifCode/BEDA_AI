@@ -313,11 +313,12 @@ async def submit_review_decision(review_id: str, payload: DecisionPayload):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(ve))
 
 
-# Retry Endpoint
+# Retry / Replay Endpoint
 @app.post("/api/v1/enquiries/{enquiry_id}/retry", tags=["Enquiries"])
+@app.post("/api/v1/enquiries/{enquiry_id}/replay", tags=["Enquiries"])
 async def retry_enquiry(enquiry_id: str):
-    await pipeline.execute_workflow(enquiry_id)
-    return {"status": "RETRY_TRIGGERED", "enquiry_id": enquiry_id}
+    await pipeline.replay_deferred_work(enquiry_id)
+    return {"status": "REPLAY_TRIGGERED", "enquiry_id": enquiry_id}
 
 
 # Audit Endpoint
