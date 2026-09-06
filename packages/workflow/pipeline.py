@@ -210,7 +210,14 @@ class WorkflowPipeline:
         # Step 1: Normalization
         await self._record_step(enquiry_id, "NORMALIZATION", "IN_PROGRESS")
         enquiry.body_text = normalize_whitespace(enquiry.body_text)
-        await self._update_status(enquiry_id, WorkflowStatus.NORMALIZED)
+        async with get_db_session() as session:
+            stmt = (
+                update(EnquiryModel)
+                .where(EnquiryModel.id == enquiry_id)
+                .values(body_text=enquiry.body_text, workflow_status=WorkflowStatus.NORMALIZED.value, updated_at=datetime.now(timezone.utc))
+            )
+            await session.execute(stmt)
+            await session.commit()
         await self._record_step(enquiry_id, "NORMALIZATION", "COMPLETED")
 
         # Step 2: AI Understanding (Classification & Extraction)
@@ -334,36 +341,42 @@ class WorkflowPipeline:
                     },
                 )
 
-                # If identity correction detected, record explicit IDENTITY_CORRECTION_RECEIVED audit event
+                # If identity correction detected, record explicit IDENTITY_CORRECTION_RECEIVED audit event (if not already recorded)
                 if crm_res.correction_provenance:
-                    prov = crm_res.correction_provenance
-                    prev_id = {}
-                    if "previous_email" in prov:
-                        prev_id["email"] = prov["previous_email"]
-                    if "previous_phone" in prov:
-                        prev_id["phone"] = prov["previous_phone"]
-                    corr_id = {}
-                    if "new_email" in prov:
-                        corr_id["email"] = prov["new_email"]
-                    if "new_phone" in prov:
-                        corr_id["phone"] = prov["new_phone"]
-
-                    await AuditService.record_event(
-                        session=session,
-                        enquiry_id=enquiry_id,
-                        event_type="IDENTITY_CORRECTION_RECEIVED",
-                        actor_type="SYSTEM",
-                        actor_id="identity_resolver",
-                        outcome="PENDING_REVIEW",
-                        metadata_json={
-                            "correction_type": "CONTACT_IDENTITY_CORRECTION",
-                            "existing_customer_id": prov.get("existing_customer_id"),
-                            "previous_identity": prev_id,
-                            "corrected_identity": corr_id,
-                            "source_enquiry_id": enquiry_id,
-                            "mode": "DEGRADED_MODE",
-                        },
+                    corr_stmt = select(AuditEventModel).where(
+                        AuditEventModel.enquiry_id == enquiry_id,
+                        AuditEventModel.event_type == "IDENTITY_CORRECTION_RECEIVED",
                     )
+                    existing_corr = (await session.execute(corr_stmt)).first()
+                    if not existing_corr:
+                        prov = crm_res.correction_provenance
+                        prev_id = {}
+                        if "previous_email" in prov:
+                            prev_id["email"] = prov["previous_email"]
+                        if "previous_phone" in prov:
+                            prev_id["phone"] = prov["previous_phone"]
+                        corr_id = {}
+                        if "new_email" in prov:
+                            corr_id["email"] = prov["new_email"]
+                        if "new_phone" in prov:
+                            corr_id["phone"] = prov["new_phone"]
+
+                        await AuditService.record_event(
+                            session=session,
+                            enquiry_id=enquiry_id,
+                            event_type="IDENTITY_CORRECTION_RECEIVED",
+                            actor_type="SYSTEM",
+                            actor_id="identity_resolver",
+                            outcome="PENDING_REVIEW",
+                            metadata_json={
+                                "correction_type": "CONTACT_IDENTITY_CORRECTION",
+                                "existing_customer_id": prov.get("existing_customer_id"),
+                                "previous_identity": prev_id,
+                                "corrected_identity": corr_id,
+                                "source_enquiry_id": enquiry_id,
+                                "mode": "DEGRADED_MODE",
+                            },
+                        )
 
                 # Persist deferred draft with blank content (Section 6 & 7)
                 db_draft = DraftModel(
@@ -398,42 +411,69 @@ class WorkflowPipeline:
             logger.info(f"Enquiry {enquiry_id} safely deferred in DEGRADED_MODE. No customer-facing draft or outbound event created.")
             return
 
-        # Normal AI Run persistence when live model succeeded or deterministic classification
+        # AI Run persistence: clearly distinguish live LLM execution from deterministic rules in degraded mode (Section 8)
         async with get_db_session() as session:
+            ai_task = "deterministic_classification" if degraded_mode else "classify_and_extract"
+            ai_provider = "deterministic_rules" if degraded_mode else provider_name
+            ai_model = "deterministic_rule_engine" if degraded_mode else model_name
+
             db_ai = AIRunModel(
                 enquiry_id=enquiry_id,
-                task="classify_and_extract",
-                provider=provider_name,
-                model=model_name,
+                task=ai_task,
+                provider=ai_provider,
+                model=ai_model,
                 prompt_version="v1.0",
-                output_json={"classification": cls_result.model_dump(), "extracted": ext_result.model_dump()},
+                output_json={
+                    "classification": cls_result.model_dump(),
+                    "extracted": ext_result.model_dump(),
+                    **({"source": "DETERMINISTIC_RULES", "mode": "DEGRADED_MODE"} if degraded_mode else {}),
+                },
                 validation_status="VALID",
                 confidence=cls_result.confidence,
                 latency_ms=latency_ms,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                error_code=error_code,
+                input_tokens=input_tokens if not degraded_mode else 0,
+                output_tokens=output_tokens if not degraded_mode else 0,
+                error_code=error_code if not degraded_mode else None,
             )
             session.add(db_ai)
 
-            await AuditService.record_event(
-                session=session,
-                enquiry_id=enquiry_id,
-                event_type="AI_UNDERSTANDING_COMPLETED",
-                actor_type="LLM" if not degraded_mode else "SYSTEM",
-                actor_id=provider_name,
-                model_provider=provider_name,
-                model_version=model_name,
-                outcome="SUCCESS",
-                metadata_json={
-                    "category": cls_result.category,
-                    "confidence": cls_result.confidence,
-                    "latency_ms": latency_ms,
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "error_code": error_code,
-                },
-            )
+            if degraded_mode:
+                await AuditService.record_event(
+                    session=session,
+                    enquiry_id=enquiry_id,
+                    event_type="DETERMINISTIC_UNDERSTANDING_COMPLETED",
+                    actor_type="SYSTEM",
+                    actor_id="deterministic_rules",
+                    model_provider=None,
+                    model_version=None,
+                    outcome="SUCCESS",
+                    metadata_json={
+                        "category": cls_result.category,
+                        "confidence": cls_result.confidence,
+                        "mode": "DEGRADED_MODE",
+                        "source": "DETERMINISTIC_RULES",
+                        "rule_reason": cls_result.reason_code,
+                    },
+                )
+            else:
+                await AuditService.record_event(
+                    session=session,
+                    enquiry_id=enquiry_id,
+                    event_type="AI_UNDERSTANDING_COMPLETED",
+                    actor_type="LLM",
+                    actor_id=provider_name,
+                    model_provider=provider_name,
+                    model_version=model_name,
+                    outcome="SUCCESS",
+                    metadata_json={
+                        "category": cls_result.category,
+                        "confidence": cls_result.confidence,
+                        "latency_ms": latency_ms,
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "error_code": error_code,
+                    },
+                )
             await session.commit()
 
         await self._record_step(enquiry_id, "AI_UNDERSTANDING", "COMPLETED")
@@ -505,35 +545,41 @@ class WorkflowPipeline:
                 },
             )
 
-            # Record IDENTITY_CORRECTION_RECEIVED if correction provenance is present
+            # Record IDENTITY_CORRECTION_RECEIVED if correction provenance is present (and not previously recorded)
             if crm_res.correction_provenance:
-                prov = crm_res.correction_provenance
-                prev_id = {}
-                if "previous_email" in prov:
-                    prev_id["email"] = prov["previous_email"]
-                if "previous_phone" in prov:
-                    prev_id["phone"] = prov["previous_phone"]
-                corr_id = {}
-                if "new_email" in prov:
-                    corr_id["email"] = prov["new_email"]
-                if "new_phone" in prov:
-                    corr_id["phone"] = prov["new_phone"]
-
-                await AuditService.record_event(
-                    session=session,
-                    enquiry_id=enquiry_id,
-                    event_type="IDENTITY_CORRECTION_RECEIVED",
-                    actor_type="SYSTEM",
-                    actor_id="identity_resolver",
-                    outcome="PENDING_REVIEW",
-                    metadata_json={
-                        "correction_type": "CONTACT_IDENTITY_CORRECTION",
-                        "existing_customer_id": prov.get("existing_customer_id"),
-                        "previous_identity": prev_id,
-                        "corrected_identity": corr_id,
-                        "source_enquiry_id": enquiry_id,
-                    },
+                corr_stmt = select(AuditEventModel).where(
+                    AuditEventModel.enquiry_id == enquiry_id,
+                    AuditEventModel.event_type == "IDENTITY_CORRECTION_RECEIVED",
                 )
+                existing_corr = (await session.execute(corr_stmt)).first()
+                if not existing_corr:
+                    prov = crm_res.correction_provenance
+                    prev_id = {}
+                    if "previous_email" in prov:
+                        prev_id["email"] = prov["previous_email"]
+                    if "previous_phone" in prov:
+                        prev_id["phone"] = prov["previous_phone"]
+                    corr_id = {}
+                    if "new_email" in prov:
+                        corr_id["email"] = prov["new_email"]
+                    if "new_phone" in prov:
+                        corr_id["phone"] = prov["new_phone"]
+
+                    await AuditService.record_event(
+                        session=session,
+                        enquiry_id=enquiry_id,
+                        event_type="IDENTITY_CORRECTION_RECEIVED",
+                        actor_type="SYSTEM",
+                        actor_id="identity_resolver",
+                        outcome="PENDING_REVIEW",
+                        metadata_json={
+                            "correction_type": "CONTACT_IDENTITY_CORRECTION",
+                            "existing_customer_id": prov.get("existing_customer_id"),
+                            "previous_identity": prev_id,
+                            "corrected_identity": corr_id,
+                            "source_enquiry_id": enquiry_id,
+                        },
+                    )
 
             await session.commit()
 
@@ -703,11 +749,15 @@ class WorkflowPipeline:
                 logger.error(f"Enquiry {enquiry_id} not found for replay!")
                 return
 
-            if enquiry_db.workflow_status in [WorkflowStatus.COMPLETED.value, "REJECTED"]:
-                logger.info(f"Enquiry {enquiry_id} already in terminal state {enquiry_db.workflow_status}. Replay skipped.")
+            if enquiry_db.workflow_status in [
+                WorkflowStatus.COMPLETED.value,
+                WorkflowStatus.APPROVAL.value,
+                "REJECTED",
+            ]:
+                logger.info(f"Enquiry {enquiry_id} already in state {enquiry_db.workflow_status}. Replay skipped.")
                 return
 
-            # Record audit event for replay
+            # Record audit event for replay start
             await AuditService.record_event(
                 session=session,
                 enquiry_id=enquiry_id,
@@ -733,6 +783,27 @@ class WorkflowPipeline:
 
         # Re-execute workflow with live model
         await self.execute_workflow(enquiry_id)
+
+        # Record recovery completion event if workflow transitioned out of DEFERRED (Requirement 4)
+        async with get_db_session() as session:
+            stmt = select(EnquiryModel).where(EnquiryModel.id == enquiry_id)
+            enquiry_db = (await session.execute(stmt)).scalar_one_or_none()
+            if enquiry_db and enquiry_db.workflow_status != WorkflowStatus.DEFERRED.value:
+                await AuditService.record_event(
+                    session=session,
+                    enquiry_id=enquiry_id,
+                    event_type="MODEL_RECOVERY_REPLAYED",
+                    actor_type="SYSTEM",
+                    actor_id="recovery_service",
+                    outcome="SUCCESS",
+                    metadata_json={
+                        "previous_state": "DEFERRED",
+                        "recovery_mode": "REPLAY",
+                        "enquiry_id": enquiry_id,
+                        "replayed": True,
+                    },
+                )
+                await session.commit()
 
     async def execute_review_decision(
         self,
@@ -844,6 +915,20 @@ class WorkflowPipeline:
         assigned_to: Optional[str],
     ) -> None:
         async with get_db_session() as session:
+            # Check for existing open review task for this enquiry (Requirement 3: no duplicate review tasks)
+            stmt = select(ReviewTaskModel).where(
+                ReviewTaskModel.enquiry_id == enquiry_id,
+                ReviewTaskModel.status == "OPEN",
+            )
+            existing_task = (await session.execute(stmt)).scalars().first()
+            if existing_task:
+                existing_task.task_type = task_type
+                existing_task.reason_code = reason_code
+                existing_task.priority = priority
+                existing_task.assigned_to = assigned_to
+                await session.commit()
+                return
+
             task = ReviewTaskModel(
                 enquiry_id=enquiry_id,
                 task_type=task_type,

@@ -260,6 +260,37 @@ class IdentityResolver:
                     correction_provenance=provenance,
                 )
 
+        # Case: Email matched single CRM record, but sender phone changed or is new
+        if len(exact_email_candidates) == 1 and sender_phone:
+            cand = exact_email_candidates[0]
+            cand_phone_norm = normalize_phone(cand.phone) if cand.phone else None
+            sender_phone_norm = normalize_phone(sender_phone)
+            if cand_phone_norm and sender_phone_norm and cand_phone_norm != sender_phone_norm:
+                provenance = {
+                    "correction_type": "CONTACT_IDENTITY_CORRECTION",
+                    "existing_customer_id": cand.customer_id,
+                    "previous_phone": cand.phone,
+                    "new_phone": sender_phone,
+                    "source_enquiry_id": enquiry.enquiry_id,
+                }
+                if sender_email:
+                    provenance["previous_email"] = cand.email or sender_email
+                    provenance["new_email"] = sender_email
+
+                conflict_flags.append(
+                    f"CONTACT_IDENTITY_CORRECTION for customer {cand.customer_id}: email matched, but phone '{sender_phone}' differs from CRM phone '{cand.phone}'. Human review required before CRM mutation."
+                )
+                conflict_flags.append(json.dumps(provenance))
+
+                return CRMResolutionResult(
+                    status=CRMResolutionStatus.AMBIGUOUS,
+                    method=CRMResolutionMethod.EXACT_EMAIL,
+                    selected_customer_id=cand.customer_id,
+                    candidates=[cand],
+                    conflict_flags=conflict_flags,
+                    correction_provenance=provenance,
+                )
+
         # Case: Explicit identity conflict without CRM match (e.g. fixture E010 where Sam is not in CRM seed)
         if "Updated phone from previous 0411 999 120" in constraints_str or (
             ("0411 999 102" in sender_phone or "0411 999 102" in body_text) and "0411 999 120" in body_text

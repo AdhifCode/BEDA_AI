@@ -89,13 +89,14 @@ async def test_all_models_down_safety():
     """
     pipeline = WorkflowPipeline(llm=OutageLLMProvider(), crm=MockCRMClient())
 
+    raw_body = "   Hi team,   we are looking for a 200kW solar installation across our two sites in Campbellfield.   Please provide a quote.   "
     enquiry = CanonicalEnquiry(
         idempotency_key=f"outage-test-{uuid.uuid4().hex[:8]}",
         source_channel="email",
         source_message_id=f"msg-outage-{uuid.uuid4().hex[:8]}",
         sender=SenderInfo(name="Jane Doe", email="jane@acme.example", phone="0400 999 888"),
         subject="Solar feasibility inquiry for 2 factory sites",
-        body_text="Hi team, we are looking for a 200kW solar installation across our two sites in Campbellfield. Please provide a quote.",
+        body_text=raw_body,
     )
 
     async with get_db_session() as session:
@@ -106,6 +107,20 @@ async def test_all_models_down_safety():
     # 1. Ingest and persist
     enquiry, is_dup = await pipeline.ingest_and_persist(enquiry, {"raw": "data"}, "email")
     assert not is_dup
+    assert enquiry.enquiry_id is not None
+
+    # Verify duplicate / idempotency protection remains intact during outage
+    dup_enquiry = CanonicalEnquiry(
+        idempotency_key=enquiry.idempotency_key,
+        source_channel="email",
+        source_message_id=enquiry.source_message_id,
+        sender=enquiry.sender,
+        subject=enquiry.subject,
+        body_text=raw_body,
+    )
+    dup_res, is_dup_2 = await pipeline.ingest_and_persist(dup_enquiry, {"raw": "dup_data"}, "email")
+    assert is_dup_2 is True
+    assert dup_res.enquiry_id == enquiry.enquiry_id
 
     # 2. Execute workflow under outage
     await pipeline.execute_workflow(enquiry.enquiry_id)
@@ -115,6 +130,20 @@ async def test_all_models_down_safety():
         db_enq = await session.get(EnquiryModel, enquiry.enquiry_id)
         assert db_enq is not None
         assert db_enq.workflow_status == "DEFERRED"
+
+        # Normalization occurred: whitespace normalized
+        assert db_enq.body_text == "Hi team, we are looking for a 200kW solar installation across our two sites in Campbellfield. Please provide a quote."
+        
+        # Normalization workflow step completed
+        from db.models.schema import WorkflowStepModel
+        norm_step = (await session.execute(
+            select(WorkflowStepModel).where(
+                WorkflowStepModel.enquiry_id == enquiry.enquiry_id,
+                WorkflowStepModel.step_name == "NORMALIZATION",
+                WorkflowStepModel.status == "COMPLETED",
+            )
+        )).scalar_one_or_none()
+        assert norm_step is not None
 
         # Draft assertions: MUST be blank and marked DEFERRED_MODEL_UNAVAILABLE
         draft_stmt = select(DraftModel).where(DraftModel.enquiry_id == enquiry.enquiry_id)
@@ -136,13 +165,21 @@ async def test_all_models_down_safety():
         outbox_events = (await session.execute(outbox_stmt)).scalars().all()
         assert len(outbox_events) == 0
 
-        # CRM customer count assertions: NO customer created
+        # CRM customer count assertions: NO customer created or merged/updated
         post_customer_count = (
             await session.execute(select(func.count(CRMCustomerModel.customer_id)))
         ).scalar_one()
         assert post_customer_count == initial_customer_count
 
-        # Audit trail assertions: MODEL_UNAVAILABLE event recorded
+        # Deferred work persisted in AI run
+        from db.models.schema import AIRunModel
+        ai_run_stmt = select(AIRunModel).where(AIRunModel.enquiry_id == enquiry.enquiry_id)
+        ai_run = (await session.execute(ai_run_stmt)).scalar_one_or_none()
+        assert ai_run is not None
+        assert ai_run.validation_status == "DEFERRED"
+        assert ai_run.error_code == "MODEL_UNAVAILABLE"
+
+        # Audit trail assertions: MODEL_UNAVAILABLE and DUPLICATE_IGNORED recorded
         audit_stmt = (
             select(AuditEventModel)
             .where(AuditEventModel.enquiry_id == enquiry.enquiry_id)
@@ -151,6 +188,7 @@ async def test_all_models_down_safety():
         audit_events = (await session.execute(audit_stmt)).scalars().all()
         event_types = [e.event_type for e in audit_events]
         assert "MODEL_UNAVAILABLE" in event_types
+        assert "DUPLICATE_IGNORED" in event_types
 
         model_unavail_ev = next(e for e in audit_events if e.event_type == "MODEL_UNAVAILABLE")
         assert model_unavail_ev.outcome == "DEFERRED"
@@ -274,7 +312,7 @@ async def test_corrected_identity_and_replay():
         outbox_events = (await session.execute(outbox_stmt)).scalars().all()
         assert len(outbox_events) == 0
 
-        # Check audit trail has both events and valid chain
+        # Check audit trail has both events, exact identity provenance, and valid chain
         audit_stmt = (
             select(AuditEventModel)
             .where(AuditEventModel.enquiry_id == original_enquiry_id)
@@ -284,6 +322,14 @@ async def test_corrected_identity_and_replay():
         event_types = [e.event_type for e in audit_events]
         assert "IDENTITY_CORRECTION_RECEIVED" in event_types
         assert "MODEL_UNAVAILABLE" in event_types
+
+        # Explicitly verify previous and corrected identity values in provenance
+        corr_ev = next(e for e in audit_events if e.event_type == "IDENTITY_CORRECTION_RECEIVED")
+        assert corr_ev.metadata_json.get("existing_customer_id") == "C099"
+        assert corr_ev.metadata_json.get("previous_identity", {}).get("phone") == "0411 999 120"
+        assert corr_ev.metadata_json.get("previous_identity", {}).get("email") == "old@example.com"
+        assert corr_ev.metadata_json.get("corrected_identity", {}).get("phone") == "0411 999 102"
+        assert corr_ev.metadata_json.get("corrected_identity", {}).get("email") == "new@example.com"
 
         is_chain_valid = await AuditService.verify_chain(session, original_enquiry_id)
         assert is_chain_valid is True
@@ -316,7 +362,7 @@ async def test_corrected_identity_and_replay():
             .where(ReviewTaskModel.enquiry_id == original_enquiry_id, ReviewTaskModel.status == "OPEN")
         )
         open_tasks = (await session.execute(task_stmt)).scalars().all()
-        assert len(open_tasks) > 0
+        assert len(open_tasks) == 1
 
         # Still no new customer created autonomously
         final_count = (
@@ -324,7 +370,7 @@ async def test_corrected_identity_and_replay():
         ).scalar_one()
         assert final_count == initial_customer_count
 
-        # Audit trail includes MODEL_RECOVERY_REPLAY
+        # Audit trail includes MODEL_RECOVERY_REPLAY and MODEL_RECOVERY_REPLAYED
         audit_stmt = (
             select(AuditEventModel)
             .where(AuditEventModel.enquiry_id == original_enquiry_id)
@@ -333,8 +379,57 @@ async def test_corrected_identity_and_replay():
         all_audit_events = (await session.execute(audit_stmt)).scalars().all()
         all_event_types = [e.event_type for e in all_audit_events]
         assert "MODEL_RECOVERY_REPLAY" in all_event_types
+        assert "MODEL_RECOVERY_REPLAYED" in all_event_types
+
+        # Assert MODEL_RECOVERY_REPLAYED contains recovery metadata (Requirement 4)
+        recovery_replayed_ev = next(e for e in all_audit_events if e.event_type == "MODEL_RECOVERY_REPLAYED")
+        assert recovery_replayed_ev.metadata_json.get("previous_state") == "DEFERRED"
+        assert recovery_replayed_ev.metadata_json.get("recovery_mode") == "REPLAY"
+        assert recovery_replayed_ev.metadata_json.get("enquiry_id") == original_enquiry_id
+        assert recovery_replayed_ev.metadata_json.get("replayed") is True
+
+        # Exactly 1 IDENTITY_CORRECTION_RECEIVED event exists (no duplicate identity correction created)
+        corr_events = [e for e in all_audit_events if e.event_type == "IDENTITY_CORRECTION_RECEIVED"]
+        assert len(corr_events) == 1
 
         # Complete cryptographic audit chain remains fully verified
+        is_chain_valid = await AuditService.verify_chain(session, original_enquiry_id)
+        assert is_chain_valid is True
+
+    # 8. Replay the SAME enquiry a second time to assert idempotency (Requirement 3: replay(E010) replay(E010))
+    await pipeline.replay_deferred_work(original_enquiry_id)
+
+    async with get_db_session() as session:
+        # Assert no duplicate customer created
+        post_second_replay_count = (
+            await session.execute(select(func.count(CRMCustomerModel.customer_id)))
+        ).scalar_one()
+        assert post_second_replay_count == initial_customer_count
+
+        # Assert no duplicate open review tasks
+        task_stmt = (
+            select(ReviewTaskModel)
+            .where(ReviewTaskModel.enquiry_id == original_enquiry_id, ReviewTaskModel.status == "OPEN")
+        )
+        open_tasks = (await session.execute(task_stmt)).scalars().all()
+        assert len(open_tasks) == 1
+
+        # Assert no duplicate identity correction events
+        audit_stmt = (
+            select(AuditEventModel)
+            .where(AuditEventModel.enquiry_id == original_enquiry_id)
+            .order_by(AuditEventModel.timestamp.asc())
+        )
+        final_audit_events = (await session.execute(audit_stmt)).scalars().all()
+        final_corr_events = [e for e in final_audit_events if e.event_type == "IDENTITY_CORRECTION_RECEIVED"]
+        assert len(final_corr_events) == 1
+
+        # Assert no outbound event was dispatched autonomously
+        outbox_stmt = select(OutboxEventModel).where(OutboxEventModel.aggregate_id == original_enquiry_id)
+        outbox_events = (await session.execute(outbox_stmt)).scalars().all()
+        assert len(outbox_events) == 0
+
+        # Assert audit chain remains valid
         is_chain_valid = await AuditService.verify_chain(session, original_enquiry_id)
         assert is_chain_valid is True
 
