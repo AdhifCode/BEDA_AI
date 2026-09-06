@@ -138,6 +138,6 @@ settings.local.*
 # -------------------------
 *.secret
 *.secrets
-*.md
+.md
 !README.md
 !LICENSE.md
